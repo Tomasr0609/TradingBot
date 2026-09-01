@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "Bot de trading autónomo para Binance Testnet"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.0.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.12.0",
+    "pandas>=2.0.0",
+    "pandas-ta>=0.3.14b0",
+    "python-dotenv>=1.0.0",
+    "python-telegram-bot>=20.0",
+    "asyncio-throttle>=1.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+    "aiosqlite>=0.19.0",
+]
+postgres = [
+    "asyncpg>=0.29.0",
+    "psycopg2-binary>=2.9.0",
+]
+sqlite = [
+    "aiosqlite>=0.19.0",
+]
+vectorbt = [
+    "vectorbt>=0.27.0",
+]
+backtrader = [
+    "backtrader>=1.9.78",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["trading_bot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

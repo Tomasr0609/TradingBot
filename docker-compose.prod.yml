@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trading_bot_prod
+      POSTGRES_USER: trader_prod
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - pgdata_prod:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader_prod -d trading_bot_prod"]
+      interval: 5s
+      retries: 10
+
+  bot:
+    build: .
+    restart: "no"  # no auto-restart en prod, requiere supervisión manual
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env.production
+    environment:
+      DATABASE_URL: postgresql+asyncpg://trader_prod:${POSTGRES_PASSWORD}@db:5432/trading_bot_prod
+    volumes:
+      - ./logs:/app/logs
+    command: sh -c "alembic upgrade head && python scripts/run_bot.py"
+
+volumes:
+  pgdata_prod:
