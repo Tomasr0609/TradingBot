@@ -45,6 +45,7 @@ def run_backtest(
     initial_capital: float = 10000,
     fees: float = 0.001,  # 0.1% per trade
     slippage: float = 0.0005,  # 0.05% slippage
+    use_stop_loss: bool = True,
 ) -> BacktestResult:
     """
     Run vectorized backtest using vectorbt.
@@ -74,6 +75,23 @@ def run_backtest(
     # We use close prices for execution (conservative)
     close_prices = df["close"]
 
+    # Stop-loss real del bot: 2*ATR (mismo que risk_management/engine.py:339)
+    # Convertido a porcentaje para vectorbt sl_stop (vectorbt espera % desde entry)
+    # Si ATR varía por vela, sl_stop es un array alineado con entries
+    # Solo se aplica si use_stop_loss True (para test comparativo sin stop)
+    if use_stop_loss:
+        if "atr_14" in df.columns:
+            atr = df["atr_14"]
+            # Evitar división por cero y NaNs del warmup
+            sl_stop = (2 * atr) / close_prices
+            sl_stop = sl_stop.replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=0.005, upper=0.5)
+        else:
+            # Fallback si por algún motivo no hay ATR (no debería pasar, compute_indicators siempre lo genera)
+            sl_stop = 0.02
+        portfolio_kwargs = dict(sl_stop=sl_stop)
+    else:
+        portfolio_kwargs = {}
+
     portfolio = vbt.Portfolio.from_signals(
         close=close_prices,
         entries=entries,
@@ -83,6 +101,7 @@ def run_backtest(
         slippage=slippage,
         freq=timeframe,
         direction="both",  # Allow both long and short
+        **portfolio_kwargs,
     )
 
     # Extract metrics
@@ -130,6 +149,11 @@ def run_backtest(
         sharpe_ratio = 0
         sortino_ratio = 0
 
+    # max_drawdown absoluto (dinero) no existe como "Max Drawdown" en vectorbt 0.27; calcular desde equity_curve
+    running_max = equity_curve.cummax()
+    drawdown_series = running_max - equity_curve
+    max_drawdown = float(drawdown_series.max()) if len(drawdown_series) > 0 else 0.0
+
     return BacktestResult(
         strategy_name=strategy.name,
         symbol=symbol,
@@ -140,7 +164,7 @@ def run_backtest(
         final_value=equity_curve.iloc[-1],
         total_return=equity_curve.iloc[-1] - initial_capital,
         total_return_pct=(equity_curve.iloc[-1] / initial_capital - 1) * 100,
-        max_drawdown=stats["Max Drawdown"],
+        max_drawdown=max_drawdown,
         max_drawdown_pct=stats["Max Drawdown [%]"],
         sharpe_ratio=sharpe_ratio,
         sortino_ratio=sortino_ratio,

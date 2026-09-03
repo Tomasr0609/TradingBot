@@ -123,6 +123,7 @@ class KlineWebSocketListener:
                 session.add(kline)
 
             await session.flush()
+            await session.commit()
 
             # Call callback if provided (for real-time processing)
             if self._on_kline and is_closed:

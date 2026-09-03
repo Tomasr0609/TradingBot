@@ -6,7 +6,7 @@ Resiliente a errores parciales: un módulo que falle no tumba todo el proceso.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 import pandas as pd
 from sqlalchemy import select
@@ -81,6 +81,9 @@ class TradingBot:
                 logger.warning(f"Exchange init failed (continuará en paper si falla): {e}")
                 self.exchange_client = None
         self.executor = OrderExecutor(risk_engine=self.risk_engine, exchange_client=self.exchange_client._exchange if self.exchange_client and hasattr(self.exchange_client, "_exchange") else self.exchange_client)
+        # Actualización de datos vía REST cada {poll}s para {symbols} (reemplaza WebSocket no soportado en ccxt gratuito)
+        poll = min(60, timeframe_to_seconds(self.settings.trading_timeframe) // 2) if timeframe_to_seconds(self.settings.trading_timeframe) > 60 else 30
+        logger.info(f"Actualización de datos vía REST cada {poll}s para {self.settings.symbols_list}")
         # Telegram optional
         if self.settings.telegram_bot_token:
             try:
@@ -160,8 +163,53 @@ class TradingBot:
                         pass
                 continue
 
+    async def _refresh_via_rest(self, symbol: str, timeframe: str) -> None:
+        """Polling REST incremental: pide solo velas nuevas desde la última guardada (liviano, pocas velas)."""
+        try:
+            async with self.db.session() as session:
+                result = await session.execute(
+                    select(Kline).where(Kline.symbol == symbol, Kline.timeframe == timeframe).order_by(Kline.open_time.desc()).limit(1)
+                )
+                last = result.scalar_one_or_none()
+                from trading_bot.data_collection.historical import HistoricalDataIngester
+                ingester = HistoricalDataIngester(session)
+                if last:
+                    # Calcular since = última vela + 1 intervalo (maneja naive/aware de SQLite)
+                    unit = timeframe[-1]
+                    val = int(timeframe[:-1])
+                    if unit == "m":
+                        delta = timedelta(minutes=val)
+                    elif unit == "h":
+                        delta = timedelta(hours=val)
+                    elif unit == "d":
+                        delta = timedelta(days=val)
+                    elif unit == "w":
+                        delta = timedelta(weeks=val)
+                    else:
+                        delta = timedelta(hours=1)
+                    last_time = last.open_time
+                    if last_time.tzinfo is None:
+                        last_time = last_time.replace(tzinfo=timezone.utc)
+                    since = last_time + delta
+                    now = datetime.now(timezone.utc)
+                    if since.tzinfo is None:
+                        since = since.replace(tzinfo=timezone.utc)
+                    if since > now:
+                        return
+                    await ingester.ingest_symbol(symbol, timeframe, since=since)
+                else:
+                    # Arranque en frío
+                    await ingester.ingest_symbol(symbol, timeframe, days_back=7)
+        except Exception as e:
+            logger.warning(f"REST polling failed for {symbol} {timeframe}: {e}")
+
     async def _process_symbol(self, symbol: str, timeframe: str, strategy):
-        # 1) Recolección
+        # 1) Recolección vía REST incremental (reemplaza WebSocket no soportado en ccxt gratuito)
+        try:
+            await self._refresh_via_rest(symbol, timeframe)
+        except Exception as e:
+            logger.warning(f"REST refresh error for {symbol}: {e}")
+        # Luego leer de BD ya actualizada
         try:
             df = await self._load_recent_candles(symbol, timeframe)
         except Exception as e:
@@ -190,7 +238,7 @@ class TradingBot:
             # Only act on last closed candle signal
             last_signal = int(signals.iloc[-1]) if len(signals) else 0
             if last_signal == 0:
-                logger.debug(f"No signal {symbol} last={last_signal} regime={regime}")
+                logger.info(f"Ciclo OK {symbol} | precio={last_close:.2f} | régimen={regime} | señal=ninguna")
                 return
             signal_type = "BUY" if last_signal == 1 else "SELL"
             # Stop loss from strategy
@@ -274,6 +322,8 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Risk/Execution failed {symbol}: {e}", exc_info=True)
             return
+        # Heartbeat siempre para ciclo con señal (una sola línea por símbolo por ciclo)
+        logger.info(f"Ciclo OK {symbol} | precio={last_close:.2f} | régimen={regime} | señal={signal_type}")
 
     async def run_forever(self):
         self.running = True

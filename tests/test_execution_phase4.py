@@ -150,9 +150,16 @@ async def test_real_testnet_ccxt_mock(patched_db, risk_engine):
 
 @pytest.mark.asyncio
 async def test_bot_loop_resilient_to_partial_failure(patched_db):
-    # Mock get_binance_client to avoid real network
+    # Mock get_binance_client and websocket listener to avoid real network
     with patch("trading_bot.bot.get_binance_client") as mock_get_client, \
-         patch("trading_bot.bot.get_telegram_notifier") as mock_tele:
+         patch("trading_bot.bot.get_telegram_notifier") as mock_tele, \
+         patch("trading_bot.data_collection.websocket.KlineWebSocketListener") as MockWS:
+        mock_ws_instance = AsyncMock()
+        mock_ws_instance.start = AsyncMock()
+        mock_ws_instance.stop = AsyncMock()
+        mock_ws_instance._running = True
+        mock_ws_instance._tasks = []
+        MockWS.return_value = mock_ws_instance
         mock_client=MagicMock()
         mock_client.initialize=AsyncMock()
         mock_client.close=AsyncMock()

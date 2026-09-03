@@ -1,5 +1,6 @@
 """Risk Management Engine - Core risk rules and position sizing."""
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -8,6 +9,8 @@ from typing import Optional
 from trading_bot.risk_management.models import RiskDecision, RiskRule, RiskLog, DailyStats, KillSwitch
 from trading_bot.storage.database import get_database
 from trading_bot.config.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,6 +42,8 @@ class RiskEngine:
     def __init__(self) -> None:
         self._settings = get_settings()
         self._db = get_database()
+        self._cached_equity: Optional[Decimal] = None
+        self._cached_at: Optional[datetime] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -549,31 +554,117 @@ class RiskEngine:
             pass
         return result
 
-    async def _fetch_initial_equity(self) -> Decimal:
-        """Intenta obtener balance real vía fetch_balance(), fallback a 10000."""
+    async def _price_asset_to_usdt(self, asset: str) -> Optional[Decimal]:
+        """Obtiene precio asset/USDT via ticker o última vela en klines. Retorna None si no se puede."""
+        upper = asset.upper()
+        # Intentar via ccxt ticker
         try:
             from trading_bot.data_collection.client import get_binance_client
             client = get_binance_client()
-            # fetch_balance puede fallar si no hay keys o testnet no disponible -> fallback
-            bal = await client.fetch_balance()
-            # ccxt balance tiene 'total' dict
-            total = bal.get("USDT") or bal.get("total", {}).get("USDT")
-            if isinstance(total, dict):
-                total = total.get("total") or total.get("free")
-            if total is None:
-                # Suma de totals
-                total_dict = bal.get("total", {})
-                # Si hay BTC/USDT, convierte a USDT aproximado? Simplifica: busca USDT
-                total = total_dict.get("USDT", 0)
-                if total == 0 and total_dict:
-                    # fallback a equity estimada
-                    total = sum(v for v in total_dict.values() if isinstance(v, (int, float)))
-            if total and float(total) > 0:
-                return Decimal(str(total))
+            ticker = await client.fetch_ticker(f"{upper}/USDT")
+            price = ticker.get("last") or ticker.get("close") or ticker.get("price") or ticker.get("lastPrice")
+            if price is not None:
+                return Decimal(str(price))
         except Exception as e:
-            # No crítico: fallback
-            import logging
-            logging.getLogger(__name__).debug(f"fetch_balance failed, using fallback equity: {e}")
+            logger.debug(f"fetch_ticker {upper}/USDT failed: {e}")
+        # Fallback a última vela en DB
+        try:
+            from sqlalchemy import select
+            from trading_bot.storage.models import Kline
+            async with self._db.session() as session:
+                result = await session.execute(
+                    select(Kline).where(Kline.symbol == f"{upper}/USDT").order_by(Kline.open_time.desc()).limit(1)
+                )
+                k = result.scalar_one_or_none()
+                if k and k.close_price:
+                    return Decimal(str(k.close_price))
+        except Exception as e:
+            logger.debug(f"kline fallback for {upper} failed: {e}")
+        logger.warning(f"No se pudo obtener precio para {upper}/USDT - balance no valuado")
+        return None
+
+    async def _fetch_initial_equity(self) -> Decimal:
+        """Calcula equity total del portfolio (USDT + valor de posiciones) - una sola vez por ciclo, cacheado."""
+        # Cache de 5s para evitar dos llamadas redundantes en misma inicialización
+        if self._cached_equity is not None and self._cached_at and (datetime.now(timezone.utc) - self._cached_at).total_seconds() < 5:
+            return self._cached_equity
+        try:
+            from trading_bot.data_collection.client import get_binance_client
+            client = get_binance_client()
+            bal = await client.fetch_balance()
+            # Construir dict asset -> total
+            asset_totals: dict[str, Decimal] = {}
+            for k, v in bal.items():
+                if k in ("info", "free", "used", "total", "timestamp", "datetime"):
+                    continue
+                if isinstance(v, dict) and "total" in v:
+                    try:
+                        asset_totals[k] = Decimal(str(v["total"]))
+                    except:
+                        continue
+                elif isinstance(v, (int, float, str, Decimal)):
+                    try:
+                        # Evitar que total sea string vacía
+                        if str(v).strip() == "":
+                            continue
+                        asset_totals[k] = Decimal(str(v))
+                    except:
+                        continue
+            # Merge con bal.get("total") si faltan
+            total_dict = bal.get("total", {})
+            if isinstance(total_dict, dict):
+                for k, v in total_dict.items():
+                    if k not in asset_totals and v is not None:
+                        try:
+                            asset_totals[k] = Decimal(str(v))
+                        except:
+                            continue
+            if not asset_totals:
+                # Fallback extra: intentar USDT directo
+                total = bal.get("USDT")
+                if isinstance(total, dict):
+                    total = total.get("total") or total.get("free")
+                if total is not None:
+                    asset_totals["USDT"] = Decimal(str(total))
+            if not asset_totals:
+                logger.debug("Balance vacío, fallback 10000")
+                return Decimal("10000")
+            # Sumar portfolio - SOLO activos gestionados (symbols_list) + stablecoins
+            # Evita valuar cientos de dust del faucet (BNB, LTC, TRX, etc.)
+            usdt_equity = Decimal("0")
+            stablecoins = {"USDT", "BUSD", "USDC", "FDUSD", "TUSD", "DAI", "USDP"}
+            # Derivar activos gestionados desde symbols_list (ej. ["BTC/USDT","ETH/USDT"] -> {"BTC","ETH"})
+            managed_assets = set()
+            try:
+                for sym in self._settings.symbols_list:
+                    base = sym.split("/")[0].strip().upper()
+                    if base and base not in stablecoins:
+                        managed_assets.add(base)
+            except Exception:
+                managed_assets = set()
+            for asset, total in list(asset_totals.items()):
+                if total is None or total == 0:
+                    continue
+                upper = asset.upper()
+                if upper in stablecoins or upper == "USDT":
+                    usdt_equity += total
+                elif upper in managed_assets:
+                    price = await self._price_asset_to_usdt(upper)
+                    if price is None:
+                        logger.warning(f"No se pudo valuar {asset} balance {total} - skip, continúa con resto")
+                        continue
+                    usdt_equity += total * price
+                else:
+                    # Dust del faucet no gestionado - ignorar por completo (intencional, ver test_mark_to_market)
+                    logger.debug(f"Ignorando dust no gestionado {asset} balance {total} (no en symbols_list {managed_assets})")
+                    continue
+            if usdt_equity > 0:
+                self._cached_equity = usdt_equity
+                self._cached_at = datetime.now(timezone.utc)
+                logger.info(f"Equity total portfolio calculado: {usdt_equity} (balances {asset_totals})")
+                return usdt_equity
+        except Exception as e:
+            logger.debug(f"fetch_balance/portfolio failed, fallback 10000: {e}")
         return Decimal("10000")
 
     async def _get_global_state(self, session) -> "GlobalRiskState":
